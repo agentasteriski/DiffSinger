@@ -114,9 +114,49 @@ class SwiGLU(nn.Module):
         # out, gate = x.chunk(2, dim=self.dim)
         # Using torch.split instead of chunk for ONNX export compatibility.
         out, gate = torch.split(x, x.size(self.dim) // 2, dim=self.dim)
-        return out * F.silu(gate)
+        gate = F.silu(gate)
+        if x.dtype == torch.float16:
+            out_min, out_max = torch.aminmax(out.detach())
+            gate_min, gate_max = torch.aminmax(gate.detach())
+            max_abs_out = torch.max(-out_min, out_max).float()
+            max_abs_gate = torch.max(-gate_min, gate_max).float()
+            max_abs_value = max_abs_out * max_abs_gate
+            if max_abs_value > 1000:
+                ratio = (1000 / max_abs_value).half()
+                gate *= ratio
+                return (out * gate).clamp(-1000 * ratio, 1000 * ratio) / ratio
+        return out * gate
 
 
+class ATanGLU(nn.Module):
+    # ArcTan-Applies the gated linear unit function.
+    def __init__(self, dim=-1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        # out, gate = x.chunk(2, dim=self.dim)
+        # Using torch.split instead of chunk for ONNX export compatibility.
+        out, gate = torch.split(x, x.size(self.dim) // 2, dim=self.dim)
+        return out * torch.atan(gate)
+        
+        
+class KaimingNormalConv1d(torch.nn.Conv1d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        nn.init.kaiming_normal_(self.weight)
+
+
+class Transpose(nn.Module):
+    def __init__(self, dims):
+        super().__init__()
+        assert len(dims) == 2, 'dims must be a tuple of two dimensions'
+        self.dims = dims
+
+    def forward(self, x):
+        return x.transpose(*self.dims)
+        
+        
 class TransformerFFNLayer(nn.Module):
     def __init__(self, hidden_size, filter_size, kernel_size=1, dropout=0., act='gelu'):
         super().__init__()
@@ -132,6 +172,9 @@ class TransformerFFNLayer(nn.Module):
             self.act_fn = SiLU()
         elif self.act == 'swiglu':
             self.act_fn = SwiGLU()
+            filter_size_1 = filter_size * 2
+        elif self.act == 'atanglu':
+            self.act_fn = ATanGLU()
             filter_size_1 = filter_size * 2
         else:
             raise ValueError(f'{act} is not a valid activation')
@@ -166,9 +209,16 @@ class MultiheadSelfAttentionWithRoPE(nn.Module):
         
         # Dropout layer
         self.dropout = nn.Dropout(dropout)
-
+        
         # Rotary Embeddings
         self.rotary_embed = rotary_embed
+        
+        # Initialization parameters
+        nn.init.xavier_uniform_(self.in_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        if bias:
+            nn.init.constant_(self.in_proj.bias, 0.0)
+            nn.init.constant_(self.out_proj.bias, 0.0)
         
     def forward(self, x, key_padding_mask=None):
         # x: (B, L, C)
@@ -213,12 +263,116 @@ class MultiheadSelfAttentionWithRoPE(nn.Module):
         return output
         
 
+def Conv_Init(
+    module: torch.nn.Module,
+    w_init_gain: str
+    ):
+    torch.nn.init.xavier_uniform_(module.weight, gain= torch.nn.init.calculate_gain(w_init_gain))
+
+    if not module.bias is None:
+        torch.nn.init.zeros_(module.bias)
+
+    return module
+
+class Correct_Mixed_LayerNorm(torch.nn.LayerNorm):
+    def __init__(
+        self,
+        channels: int,
+        condition_channels: int,
+        beta_distribution_concentration: float = 0.2,
+        eps: float= 1e-5,
+        bias: bool= True,
+        device= None,
+        dtype= None
+        ):
+        super().__init__(
+            normalized_shape= channels,
+            eps= eps,
+            elementwise_affine= False,
+            bias= bias,
+            device= device,
+            dtype= dtype,
+            )
+        
+        self.beta_distribution = torch.distributions.Beta(
+            beta_distribution_concentration,
+            beta_distribution_concentration
+            )
+
+        self.channels = channels
+        self.affine = Conv_Init(torch.nn.Linear(
+            in_features= condition_channels,
+            out_features= channels * 2,
+            bias= True
+            ), w_init_gain= 'linear')
+        self.affine.bias.data[:channels] = 1
+        self.affine.bias.data[channels:] = 0        
+
+    def forward(
+        self,
+        x: torch.FloatTensor,
+        condition: torch.FloatTensor, # -> shape [Batch, Cond_d]
+        mixln_mask_embed: torch.FloatTensor = None  # -> shape [Batch, Cond_d]
+        ) -> torch.FloatTensor:
+        x = super().forward(x)  # [Batch, Time, X_d]
+        affine_params = self.affine(condition) # .unsqueeze(1) 
+        if affine_params.ndim == 2:
+            affine_params = affine_params.unsqueeze(1)
+        betas, gammas = torch.split(affine_params, self.channels, dim=-1)
+
+        if not self.training or x.size(0) == 1:
+            return gammas * x + betas
+
+        shuffle_indices = torch.randperm(x.size(0), device=x.device)
+        shuffled_betas = betas[shuffle_indices]
+        shuffled_gammas = gammas[shuffle_indices]
+        beta_samples = self.beta_distribution.sample((x.size(0), 1, 1)).to(x.device)
+        mixed_betas = beta_samples * betas + (1 - beta_samples) * shuffled_betas
+        mixed_gammas = beta_samples * gammas + (1 - beta_samples) * shuffled_gammas
+
+        if mixln_mask_embed is not None:
+            replacement_mask = torch.abs(mixln_mask_embed).sum(dim=1) > 0
+            if replacement_mask.any():
+                mask_affine_params = self.affine(mixln_mask_embed)
+                if mask_affine_params.ndim == 2:
+                    mask_affine_params = mask_affine_params.unsqueeze(1)
+                mask_betas, mask_gammas = torch.split(mask_affine_params, self.channels, dim=-1)
+                mixed_betas[replacement_mask] = mask_betas[replacement_mask].to(mixed_betas.dtype)
+                mixed_gammas[replacement_mask] = mask_gammas[replacement_mask].to(mixed_betas.dtype)
+
+        return mixed_gammas * x + mixed_betas
+
+
+class LlamaRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        LlamaRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
 class EncSALayer(nn.Module):
     def __init__(self, c, num_heads, dropout, attention_dropout=0.1,
-                 relu_dropout=0.1, kernel_size=9, act='gelu', rotary_embed=None):
+                 relu_dropout=0.1, kernel_size=9, act='gelu', rotary_embed=None, layer_idx=None):
         super().__init__()
         self.dropout = dropout
-        self.layer_norm1 = LayerNorm(c)
+        if layer_idx is not None:
+            self.use_mix_ln = (layer_idx in [0, 2])
+        else:
+            self.use_mix_ln = False
+        if self.use_mix_ln:
+            self.layer_norm1 = Correct_Mixed_LayerNorm(c, c)
+        else:
+            self.layer_norm1 = LayerNorm(c)
         if rotary_embed is None:
             self.self_attn = MultiheadAttention(
                 c, num_heads, dropout=attention_dropout, bias=False, batch_first=False
@@ -229,18 +383,24 @@ class EncSALayer(nn.Module):
                 c, num_heads, dropout=attention_dropout, bias=False, rotary_embed=rotary_embed
             )
             self.use_rope = True
-        self.layer_norm2 = LayerNorm(c)
+        if self.use_mix_ln:
+            self.layer_norm2 = Correct_Mixed_LayerNorm(c, c)
+        else:
+            self.layer_norm2 = LayerNorm(c)
         self.ffn = TransformerFFNLayer(
             c, 4 * c, kernel_size=kernel_size, dropout=relu_dropout, act=act
         )
 
-    def forward(self, x, encoder_padding_mask=None, **kwargs):
+    def forward(self, x, encoder_padding_mask=None, cond=None, mixln_mask_embed=None, **kwargs):
         layer_norm_training = kwargs.get('layer_norm_training', None)
         if layer_norm_training is not None:
             self.layer_norm1.training = layer_norm_training
             self.layer_norm2.training = layer_norm_training
         residual = x
-        x = self.layer_norm1(x)
+        if self.use_mix_ln:
+            x = self.layer_norm1(x, cond, mixln_mask_embed)
+        else:
+            x = self.layer_norm1(x)
         if self.use_rope:
             x = self.self_attn(x, key_padding_mask=encoder_padding_mask)
         else:
@@ -257,7 +417,10 @@ class EncSALayer(nn.Module):
         x = x * (1 - encoder_padding_mask.float())[..., None]
 
         residual = x
-        x = self.layer_norm2(x)
+        if self.use_mix_ln:
+            x = self.layer_norm2(x, cond, mixln_mask_embed)
+        else:
+            x = self.layer_norm2(x)
         x = self.ffn(x)
         x = F.dropout(x, self.dropout, training=self.training)
         x = residual + x
@@ -275,6 +438,6 @@ class SinusoidalPosEmb(nn.Module):
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
+        emb = x.unsqueeze(-1) * emb.unsqueeze(0)
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb

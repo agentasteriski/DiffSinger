@@ -5,8 +5,9 @@ from torch.nn import functional as F
 from modules.commons.common_layers import (
     NormalInitEmbedding as Embedding,
     XavierUniformInitLinear as Linear,
+    SinusoidalPosEmb,
 )
-from modules.fastspeech.tts_modules import FastSpeech2Encoder, mel2ph_to_dur
+from modules.fastspeech.tts_modules import FastSpeech2Encoder, mel2ph_to_dur, StretchRegulator
 from utils.hparams import hparams
 from utils.phoneme_utils import PAD_INDEX
 
@@ -18,13 +19,26 @@ class FastSpeech2Acoustic(nn.Module):
         self.use_lang_id = hparams.get('use_lang_id', False)
         if self.use_lang_id:
             self.lang_embed = Embedding(hparams['num_lang'] + 1, hparams['hidden_size'], padding_idx=0)
+
+        self.use_stretch_embed = hparams.get('use_stretch_embed', None)
+        assert self.use_stretch_embed is not None, "You may be loading an old version of the model checkpoint, which is incompatible with the new version due to some bug fixes. It is recommended to roll back to the old version (commit id: 6df0ee977c3728f14cb79c2db8b19df30b23a0bf)"
+        if self.use_stretch_embed:
+            self.sr = StretchRegulator()
+            self.stretch_embed = nn.Sequential(
+                SinusoidalPosEmb(hparams['hidden_size']),
+                nn.Linear(hparams['hidden_size'], hparams['hidden_size'] * 4),
+                nn.GELU(),
+                nn.Linear(hparams['hidden_size'] * 4, hparams['hidden_size']),
+            )
+            self.stretch_embed_rnn = nn.GRU(hparams['hidden_size'], hparams['hidden_size'], 1, batch_first=True)
+
         self.dur_embed = Linear(1, hparams['hidden_size'])
         self.encoder = FastSpeech2Encoder(
             hidden_size=hparams['hidden_size'], num_layers=hparams['enc_layers'],
             ffn_kernel_size=hparams['enc_ffn_kernel_size'], ffn_act=hparams['ffn_act'],
             dropout=hparams['dropout'], num_heads=hparams['num_heads'],
             use_pos_embed=hparams['use_pos_embed'], rel_pos=hparams.get('rel_pos', False), 
-            use_rope=hparams.get('use_rope', False)
+            use_rope=hparams.get('use_rope', False), use_mixln=hparams.get('use_mixln', False)
         )
 
         self.pitch_embed = Linear(1, hparams['hidden_size'])
@@ -49,6 +63,26 @@ class FastSpeech2Acoustic(nn.Module):
                 for v_name in self.variance_embed_list
             })
 
+        self.use_variance_scaling = hparams.get('use_variance_scaling', False)
+        if self.use_variance_scaling:
+            self.variance_scaling_factor = {
+                'energy': 1. / 96,
+                'breathiness': 1. / 96,
+                'voicing': 1. / 96,
+                'tension': 0.1,
+                'key_shift': 1. / 12,
+                'speed': 1.
+            }
+        else:
+            self.variance_scaling_factor = {
+                'energy': 1.,
+                'breathiness': 1.,
+                'voicing': 1.,
+                'tension': 1.,
+                'key_shift': 1.,
+                'speed': 1.
+            }
+
         self.use_key_shift_embed = hparams.get('use_key_shift_embed', False)
         if self.use_key_shift_embed:
             self.key_shift_embed = Linear(1, hparams['hidden_size'])
@@ -59,22 +93,28 @@ class FastSpeech2Acoustic(nn.Module):
 
         self.use_spk_id = hparams['use_spk_id']
         if self.use_spk_id:
-            self.spk_embed = Embedding(hparams['num_spk'], hparams['hidden_size'])
+            self.use_mix_ln = hparams.get('use_mixln', False)
+            if self.use_mix_ln:
+                self.mix_ln_blacklist = set(hparams.get('mix_ln_blacklist', []))
+                self.mix_ln_mask_id = hparams['num_spk']
+                self.spk_embed = Embedding(hparams['num_spk'] + 1, hparams['hidden_size'])
+            else:
+                self.spk_embed = Embedding(hparams['num_spk'], hparams['hidden_size'])
 
     def forward_variance_embedding(self, condition, key_shift=None, speed=None, **variances):
         if self.use_variance_embeds:
             variance_embeds = torch.stack([
-                self.variance_embeds[v_name](variances[v_name][:, :, None])
+                self.variance_embeds[v_name](variances[v_name][:, :, None] * self.variance_scaling_factor[v_name])
                 for v_name in self.variance_embed_list
             ], dim=-1).sum(-1)
             condition += variance_embeds
 
         if self.use_key_shift_embed:
-            key_shift_embed = self.key_shift_embed(key_shift[:, :, None])
+            key_shift_embed = self.key_shift_embed(key_shift[:, :, None] * self.variance_scaling_factor['key_shift'])
             condition += key_shift_embed
 
         if self.use_speed_embed:
-            speed_embed = self.speed_embed(speed[:, :, None])
+            speed_embed = self.speed_embed(speed[:, :, None] * self.variance_scaling_factor['speed'])
             condition += speed_embed
 
         return condition
@@ -85,26 +125,67 @@ class FastSpeech2Acoustic(nn.Module):
             spk_embed_id=None, languages=None,
             **kwargs
     ):
-        txt_embed = self.txt_embed(txt_tokens)
-        dur = mel2ph_to_dur(mel2ph, txt_tokens.shape[1]).float()
-        dur_embed = self.dur_embed(dur[:, :, None])
-        if self.use_lang_id:
-            lang_embed = self.lang_embed(languages)
-            extra_embed = dur_embed + lang_embed
-        else:
-            extra_embed = dur_embed
-        encoder_out = self.encoder(txt_embed, extra_embed, txt_tokens == 0)
-
-        encoder_out = F.pad(encoder_out, [0, 0, 1, 0])
-        mel2ph_ = mel2ph[..., None].repeat([1, 1, encoder_out.shape[-1]])
-        condition = torch.gather(encoder_out, 1, mel2ph_)
-
+        spk_embed=None
+        mixln_mask_embed = None
         if self.use_spk_id:
             spk_mix_embed = kwargs.get('spk_mix_embed')
             if spk_mix_embed is not None:
                 spk_embed = spk_mix_embed
             else:
-                spk_embed = self.spk_embed(spk_embed_id)[:, None, :]
+                spk_embed = self.spk_embed(spk_embed_id)
+            if self.training and self.use_mix_ln and self.mix_ln_blacklist:
+                blacklist_mask = torch.tensor(
+                    [sid.item() in self.mix_ln_blacklist for sid in spk_embed_id],
+                    device=spk_embed_id.device
+                )
+                if blacklist_mask.any():
+                    mask_id_tensor = torch.tensor(self.mix_ln_mask_id, device=spk_embed_id.device)
+                    mask_embedding_vector = self.spk_embed(mask_id_tensor)
+                    mixln_mask_embed = torch.zeros_like(spk_embed)
+                    mixln_mask_embed[blacklist_mask] = mask_embedding_vector
+            else:
+                mixln_mask_embed = None
+
+        txt_embed = self.txt_embed(txt_tokens)
+        dur = mel2ph_to_dur(mel2ph, txt_tokens.shape[1])
+        if self.use_variance_scaling:
+            dur_embed = self.dur_embed(torch.log(1 + dur[:, :, None].float()))
+        else:
+            dur_embed = self.dur_embed(dur[:, :, None].float())
+        if self.use_lang_id:
+            lang_embed = self.lang_embed(languages)
+            extra_embed = dur_embed + lang_embed
+        else:
+            extra_embed = dur_embed
+        encoder_out = self.encoder(txt_embed, extra_embed, txt_tokens == 0, spk_embed, mixln_mask_embed=mixln_mask_embed)
+
+        encoder_out = F.pad(encoder_out, [0, 0, 1, 0])
+        mel2ph_ = mel2ph[..., None].repeat([1, 1, encoder_out.shape[-1]])
+        condition = torch.gather(encoder_out, 1, mel2ph_)
+
+        if self.use_stretch_embed:
+            stretch = torch.round(1000 * self.sr(mel2ph, dur))
+            if self.training and stretch.numel() > 1000:
+                # construct a phoneme stretching index lookup table with a total of 1001 indexes (0~1000)
+                table = self.stretch_embed(torch.arange(0, 1001, device=stretch.device))
+                stretch_embed = torch.index_select(table, 0, stretch.view(-1).long()).view_as(condition)
+            else:
+                stretch_embed = self.stretch_embed(stretch)
+            condition += stretch_embed
+            self.stretch_embed_rnn.flatten_parameters()
+            stretch_embed_rnn_out, _ = self.stretch_embed_rnn(condition)
+            condition = condition + stretch_embed_rnn_out
+
+        if self.use_spk_id:
+            #spk_mix_embed = kwargs.get('spk_mix_embed')
+            #if spk_mix_embed is not None:
+            #    spk_embed = spk_mix_embed
+            #else:
+            #    spk_embed = self.spk_embed(spk_embed_id)[:, None, :]
+            if spk_mix_embed is not None:
+                spk_embed = spk_mix_embed
+            else:
+                spk_embed = spk_embed[:, None, :]
             condition += spk_embed
 
         f0_mel = (1 + f0 / 700).log()

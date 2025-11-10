@@ -10,7 +10,8 @@ from basics.base_module import CategorizedModule
 from modules.aux_decoder import AuxDecoderAdaptor
 from modules.commons.common_layers import (
     XavierUniformInitLinear as Linear,
-    NormalInitEmbedding as Embedding
+    NormalInitEmbedding as Embedding,
+    SinusoidalPosEmb
 )
 from modules.core import (
     GaussianDiffusion, PitchDiffusion, MultiVarianceDiffusion,
@@ -18,7 +19,7 @@ from modules.core import (
 )
 from modules.fastspeech.acoustic_encoder import FastSpeech2Acoustic
 from modules.fastspeech.param_adaptor import ParameterAdaptorModule
-from modules.fastspeech.tts_modules import RhythmRegulator, LengthRegulator
+from modules.fastspeech.tts_modules import RhythmRegulator, LengthRegulator, StretchRegulator
 from modules.fastspeech.variance_encoder import FastSpeech2Variance, MelodyEncoder
 from utils.hparams import hparams
 
@@ -133,6 +134,18 @@ class DiffSingerVariance(CategorizedModule, ParameterAdaptorModule):
         self.predict_dur = hparams['predict_dur']
         self.predict_pitch = hparams['predict_pitch']
 
+        self.use_stretch_embed = hparams.get('use_stretch_embed', None)
+        assert self.use_stretch_embed is not None, "You may be loading an old version of the model checkpoint, which is incompatible with the new version due to some bug fixes. It is recommended to roll back to the old version (commit id: 6df0ee977c3728f14cb79c2db8b19df30b23a0bf)"
+        if self.use_stretch_embed and (self.predict_pitch or self.predict_variances):
+            self.sr = StretchRegulator()
+            self.stretch_embed = nn.Sequential(
+                SinusoidalPosEmb(hparams['hidden_size']),
+                nn.Linear(hparams['hidden_size'], hparams['hidden_size'] * 4),
+                nn.GELU(),
+                nn.Linear(hparams['hidden_size'] * 4, hparams['hidden_size']),
+            )
+            self.stretch_embed_rnn = nn.GRU(hparams['hidden_size'], hparams['hidden_size'], 1, batch_first=True)
+
         self.use_spk_id = hparams['use_spk_id']
         if self.use_spk_id:
             self.spk_embed = Embedding(hparams['num_spk'], hparams['hidden_size'])
@@ -195,6 +208,28 @@ class DiffSingerVariance(CategorizedModule, ParameterAdaptorModule):
             else:
                 raise NotImplementedError(self.diffusion_type)
 
+        self.use_variance_scaling = hparams.get('use_variance_scaling', False)
+        self.custom_variance_scaling_factor = {
+            'energy': 1. / 96,
+            'breathiness': 1. / 96,
+            'voicing': 1. / 96,
+            'tension': 0.1,
+            'key_shift': 1. / 12,
+            'speed': 1.
+        }
+        self.default_variance_scaling_factor = {
+            'energy': 1.,
+            'breathiness': 1.,
+            'voicing': 1.,
+            'tension': 1.,
+            'key_shift': 1.,
+            'speed': 1.
+        }
+        if self.use_variance_scaling:
+            self.variance_retake_scaling = self.custom_variance_scaling_factor
+        else:
+            self.variance_retake_scaling = self.default_variance_scaling_factor
+
     def forward(
             self, txt_tokens, midi, ph2word, ph_dur=None, word_dur=None, mel2ph=None,
             note_midi=None, note_rest=None, note_dur=None, note_glide=None, mel2note=None,
@@ -214,7 +249,7 @@ class DiffSingerVariance(CategorizedModule, ParameterAdaptorModule):
         else:
             ph_spk_embed = spk_embed = None
 
-        encoder_out, dur_pred_out = self.fs2(
+        encoder_out, dur_pred_out, spd_loss, sdp_pred = self.fs2(
             txt_tokens, midi=midi, ph2word=ph2word,
             ph_dur=ph_dur, word_dur=word_dur,
             spk_embed=ph_spk_embed, languages=languages,
@@ -222,7 +257,7 @@ class DiffSingerVariance(CategorizedModule, ParameterAdaptorModule):
         )
 
         if not self.predict_pitch and not self.predict_variances:
-            return dur_pred_out, None, ({} if infer else None)
+            return dur_pred_out, None, ({} if infer else None), spd_loss, sdp_pred
 
         if mel2ph is None and word_dur is not None:  # inference from file
             dur_pred_align = self.rr(dur_pred_out, ph2word, word_dur)
@@ -233,6 +268,19 @@ class DiffSingerVariance(CategorizedModule, ParameterAdaptorModule):
         mel2ph_ = mel2ph[..., None].repeat([1, 1, hparams['hidden_size']])
         condition = torch.gather(encoder_out, 1, mel2ph_)
 
+        if self.use_stretch_embed:
+            stretch = torch.round(1000 * self.sr(mel2ph, ph_dur))
+            if self.training and stretch.numel() > 1000:
+                # construct a phoneme stretching index lookup table with a total of 1001 indexes (0~1000)
+                table = self.stretch_embed(torch.arange(0, 1001, device=stretch.device))
+                stretch_embed = torch.index_select(table, 0, stretch.view(-1).long()).view_as(condition)
+            else:
+                stretch_embed = self.stretch_embed(stretch)
+            condition += stretch_embed
+            self.stretch_embed_rnn.flatten_parameters()
+            stretch_embed_rnn_out, _ = self.stretch_embed_rnn(condition)
+            condition = condition + stretch_embed_rnn_out
+            
         if self.use_spk_id:
             condition += spk_embed
 
@@ -271,11 +319,17 @@ class DiffSingerVariance(CategorizedModule, ParameterAdaptorModule):
                     delta_pitch_in = torch.zeros_like(base_pitch)
                 else:
                     delta_pitch_in = (pitch - base_pitch) * ~pitch_retake
-                pitch_cond += self.delta_pitch_embed(delta_pitch_in[:, :, None])
+                if self.use_variance_scaling:
+                    pitch_cond += self.delta_pitch_embed(delta_pitch_in[:, :, None] / 12)
+                else:
+                    pitch_cond += self.delta_pitch_embed(delta_pitch_in[:, :, None])
             else:
                 if not retake_unset:  # retake
                     base_pitch = base_pitch * pitch_retake + pitch * ~pitch_retake
-                pitch_cond += self.base_pitch_embed(base_pitch[:, :, None])
+                if self.use_variance_scaling:
+                    pitch_cond += self.base_pitch_embed(base_pitch[:, :, None] / 128)
+                else:
+                    pitch_cond += self.base_pitch_embed(base_pitch[:, :, None])
 
             if infer:
                 pitch_pred_out = self.pitch_predictor(pitch_cond, infer=True)
@@ -285,16 +339,20 @@ class DiffSingerVariance(CategorizedModule, ParameterAdaptorModule):
             pitch_pred_out = None
 
         if not self.predict_variances:
-            return dur_pred_out, pitch_pred_out, ({} if infer else None)
+            return dur_pred_out, pitch_pred_out, ({} if infer else None), spd_loss, sdp_pred
 
         if pitch is None:
             pitch = base_pitch + pitch_pred_out
-        var_cond = condition + self.pitch_embed(pitch[:, :, None])
+        if self.use_variance_scaling:
+            var_cond = condition + self.pitch_embed(pitch[:, :, None] / 12)
+        else:
+            var_cond = condition + self.pitch_embed(pitch[:, :, None])
 
         variance_inputs = self.collect_variance_inputs(**kwargs)
+
         if variance_retake is not None:
             variance_embeds = [
-                self.variance_embeds[v_name](v_input[:, :, None]) * ~variance_retake[v_name][:, :, None]
+                self.variance_embeds[v_name](v_input[:, :, None] * self.variance_retake_scaling[v_name]) * ~variance_retake[v_name][:, :, None]
                 for v_name, v_input in zip(self.variance_prediction_list, variance_inputs)
             ]
             var_cond += torch.stack(variance_embeds, dim=-1).sum(-1)
@@ -306,4 +364,4 @@ class DiffSingerVariance(CategorizedModule, ParameterAdaptorModule):
         else:
             variances_pred_out = variance_outputs
 
-        return dur_pred_out, pitch_pred_out, variances_pred_out
+        return dur_pred_out, pitch_pred_out, variances_pred_out, spd_loss, sdp_pred

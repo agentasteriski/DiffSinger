@@ -11,6 +11,40 @@ from modules.fastspeech.variance_encoder import FastSpeech2Variance
 from utils.hparams import hparams
 from utils.phoneme_utils import PAD_INDEX
 
+def kernel_attention_pooling(spk_embed, durations, sigma_scale=4.0):
+    B, T_mel, C = spk_embed.shape
+    T_ph = durations.shape[1]
+    ph_starts = torch.cumsum(torch.cat([torch.zeros_like(durations[:, :1]), durations[:, :-1]], dim=1), dim=1)
+    ph_ends = ph_starts + durations
+    mel_indices = torch.arange(T_mel, device=spk_embed.device).view(1, 1, T_mel)
+    phoneme_to_mel_mask = (mel_indices >= ph_starts.unsqueeze(-1)) & (mel_indices < ph_ends.unsqueeze(-1))
+    relative_positions = mel_indices - ph_starts.unsqueeze(-1)
+    mu = (durations.float() - 1) / 2.0
+    mu = mu.unsqueeze(-1)
+    sigma = durations.float() / sigma_scale
+    sigma = sigma.unsqueeze(-1).clamp(min=1e-5)
+    attn_scores = torch.exp(-0.5 * torch.pow((relative_positions - mu) / sigma, 2))
+    masked_scores = attn_scores.masked_fill(~phoneme_to_mel_mask, 0.0)
+    sum_scores = masked_scores.sum(dim=2, keepdim=True) + 1e-9
+    attn_weights = masked_scores / sum_scores # [B, T_ph, T_mel]
+    ph_spk_embed = torch.bmm(attn_weights, spk_embed)
+
+    return ph_spk_embed
+
+def uniform_attention_pooling(spk_embed, durations):
+    B, T_mel, C = spk_embed.shape
+    T_ph = durations.shape[1]
+    ph_starts = torch.cumsum(torch.cat([torch.zeros_like(durations[:, :1]), durations[:, :-1]], dim=1), dim=1)
+    ph_ends = ph_starts + durations
+    mel_indices = torch.arange(T_mel, device=spk_embed.device).view(1, 1, T_mel)
+    phoneme_to_mel_mask = (mel_indices >= ph_starts.unsqueeze(-1)) & (mel_indices < ph_ends.unsqueeze(-1))
+    uniform_scores = phoneme_to_mel_mask.float()
+    sum_scores = uniform_scores.sum(dim=2, keepdim=True) + 1e-9
+    attn_weights = uniform_scores / sum_scores  # [B, T_ph, T_mel]
+    ph_spk_embed = torch.bmm(attn_weights, spk_embed)
+
+    return ph_spk_embed
+
 f0_bin = 256
 f0_max = 1100.0
 f0_min = 50.0
@@ -40,6 +74,25 @@ class LengthRegulator(nn.Module):
         return mel2ph
 
 
+class LocalDownsample(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lr = LengthRegulator()
+
+    def forward(self, x, durs):
+        """
+        Inputs: x: [B, T, H], durs: [B, N], T = sum(durs)
+        Outputs: x_down: [B, N, H]
+        """
+        seq2n = self.lr(durs)  # [B, N] => [B, T]
+        seq2dur = torch.gather(F.pad(durs, [1, 0], value=0), 1, seq2n)  # [B, T]
+        x_div = x / (seq2dur + (seq2dur == 0)).unsqueeze(-1)
+        x_down = x.new_zeros(x.size(0), durs.size(1) + 1, x.size(2)).scatter_add(
+            1, seq2n.unsqueeze(-1).expand(-1, -1, x.size(2)), x_div
+        )[:, 1:, :]  # [B, N, H]
+        return x_down
+
+
 class FastSpeech2AcousticONNX(FastSpeech2Acoustic):
     def __init__(self, vocab_size, cross_lingual_token_idx=None):
         super().__init__(vocab_size=vocab_size)
@@ -62,6 +115,11 @@ class FastSpeech2AcousticONNX(FastSpeech2Acoustic):
         if hparams['use_speed_embed']:
             self.speed_min, self.speed_max = hparams['augmentation_args']['random_time_stretching']['range']
 
+        if hparams.get('use_mixln', False):
+            self.mixln_dsp_fn = hparams.get('mixln_dsp_fn', 'kernel')
+            if self.mixln_dsp_fn == 'local':
+                self.localdownsample = LocalDownsample()
+
     # noinspection PyMethodOverriding
     def forward(
             self, tokens, durations,
@@ -73,9 +131,13 @@ class FastSpeech2AcousticONNX(FastSpeech2Acoustic):
         txt_embed = self.txt_embed(tokens)
         durations = durations * (tokens > 0)
         mel2ph = self.lr(durations)
+        _mel2ph = mel2ph
         f0 = f0 * (mel2ph > 0)
         mel2ph = mel2ph[..., None].repeat((1, 1, hparams['hidden_size']))
-        dur_embed = self.dur_embed(durations.float()[:, :, None])
+        if self.use_variance_scaling:
+            dur_embed = self.dur_embed(torch.log(1 + durations.float())[:, :, None])
+        else:
+            dur_embed = self.dur_embed(durations.float()[:, :, None])
         if self.use_lang_id:
             lang_mask = torch.any(
                 tokens[..., None] == self.cross_lingual_token_idx[None, None],
@@ -85,9 +147,29 @@ class FastSpeech2AcousticONNX(FastSpeech2Acoustic):
             extra_embed = dur_embed + lang_embed
         else:
             extra_embed = dur_embed
-        encoded = self.encoder(txt_embed, extra_embed, tokens == PAD_INDEX)
+
+        if hparams.get('use_mixln', False):
+            if self.mixln_dsp_fn == 'local':
+                ph_spk_embed = self.localdownsample(spk_embed, durations)
+            elif self.mixln_dsp_fn == 'kernel':
+                ph_spk_embed = kernel_attention_pooling(spk_embed, durations)
+            elif self.mixln_dsp_fn == 'uniform':
+                ph_spk_embed = uniform_attention_pooling(spk_embed, durations)
+            else:
+                raise ValueError(f'{self.mixln_dsp_fn} is not a valid down sample function')
+        else:
+            ph_spk_embed = None
+        encoded = self.encoder(txt_embed, extra_embed, tokens == PAD_INDEX, spk_embed=ph_spk_embed)
         encoded = F.pad(encoded, (0, 0, 1, 0))
         condition = torch.gather(encoded, 1, mel2ph)
+
+        if self.use_stretch_embed:
+            stretch = torch.round(1000 * self.sr(_mel2ph, durations))
+            table = self.stretch_embed(torch.arange(0, 1001, device=stretch.device))
+            stretch_embed = torch.index_select(table, 0, stretch.view(-1).long()).view_as(condition)
+            condition += stretch_embed
+            stretch_embed_rnn_out, _ = self.stretch_embed_rnn(condition)
+            condition += stretch_embed_rnn_out
 
         if self.f0_embed_type == 'discrete':
             pitch = f0_to_coarse(f0)
@@ -99,27 +181,27 @@ class FastSpeech2AcousticONNX(FastSpeech2Acoustic):
 
         if self.use_variance_embeds:
             variance_embeds = torch.stack([
-                self.variance_embeds[v_name](variances[v_name][:, :, None])
+                self.variance_embeds[v_name](variances[v_name][:, :, None] * self.variance_scaling_factor[v_name])
                 for v_name in self.variance_embed_list
             ], dim=-1).sum(-1)
             condition += variance_embeds
 
         if hparams['use_key_shift_embed']:
             if hasattr(self, 'frozen_key_shift'):
-                key_shift_embed = self.key_shift_embed(self.frozen_key_shift[:, None, None])
+                key_shift_embed = self.key_shift_embed(self.frozen_key_shift[:, None, None] * self.variance_scaling_factor['key_shift'])
             else:
                 gender = torch.clip(gender, min=-1., max=1.)
                 gender_mask = (gender < 0.).float()
                 key_shift = gender * ((1. - gender_mask) * self.shift_max + gender_mask * abs(self.shift_min))
-                key_shift_embed = self.key_shift_embed(key_shift[:, :, None])
+                key_shift_embed = self.key_shift_embed(key_shift[:, :, None] * self.variance_scaling_factor['key_shift'])
             condition += key_shift_embed
 
         if hparams['use_speed_embed']:
             if velocity is not None:
                 velocity = torch.clip(velocity, min=self.speed_min, max=self.speed_max)
-                speed_embed = self.speed_embed(velocity[:, :, None])
+                speed_embed = self.speed_embed(velocity[:, :, None] * self.variance_scaling_factor['speed'])
             else:
-                speed_embed = self.speed_embed(torch.FloatTensor([1.]).to(condition.device)[:, None, None])
+                speed_embed = self.speed_embed(torch.FloatTensor([1.]).to(condition.device)[:, None, None] * self.variance_scaling_factor['speed'])
             condition += speed_embed
 
         if hparams['use_spk_id']:
@@ -162,7 +244,10 @@ class FastSpeech2VarianceONNX(FastSpeech2Variance):
 
     def forward_encoder_phoneme(self, tokens, ph_dur, languages=None):
         txt_embed = self.txt_embed(tokens)
-        ph_dur_embed = self.ph_dur_embed(ph_dur.float()[:, :, None])
+        if self.use_variance_scaling:
+            ph_dur_embed = self.ph_dur_embed(torch.log(1 + ph_dur.float())[:, :, None])
+        else:
+            ph_dur_embed = self.ph_dur_embed(ph_dur.float()[:, :, None])
         if self.use_lang_id:
             lang_mask = torch.any(
                 tokens[..., None] == self.cross_lingual_token_idx[None, None],
@@ -178,9 +263,10 @@ class FastSpeech2VarianceONNX(FastSpeech2Variance):
     def forward_dur_predictor(self, encoder_out, x_masks, ph_midi, spk_embed=None):
         midi_embed = self.midi_embed(ph_midi)
         dur_cond = encoder_out + midi_embed
+        sdp_cond = encoder_out + midi_embed
         if hparams['use_spk_id'] and spk_embed is not None:
             dur_cond += spk_embed
-        ph_dur = self.dur_predictor(dur_cond, x_masks=x_masks)
+        ph_dur = self.dur_predictor(dur_cond, x_masks=x_masks, sdp_cond=sdp_cond, spk_embed=spk_embed)
         return ph_dur
 
     def view_as_encoder(self):
