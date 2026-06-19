@@ -131,6 +131,7 @@ class FastSpeech2Acoustic(nn.Module):
                 spk_embed = spk_mix_embed
             else:
                 spk_embed = self.spk_embed(spk_embed_id)[:, None, :]
+        else: spk_embed = None
         txt_embed = self.txt_embed(txt_tokens)
         dur = mel2ph_to_dur(mel2ph, txt_tokens.shape[1])
         if self.use_variance_scaling:

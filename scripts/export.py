@@ -14,11 +14,11 @@ sys.path.insert(0, str(root_dir))
 from utils.hparams import set_hparams, hparams
 
 
-def check_pytorch_version():
+#def check_pytorch_version():
     # Require PyTorch version to be exactly 1.13.x
-    if torch.__version__.startswith('1.13.'):
-        return
-    raise RuntimeError('This script requires PyTorch 1.13.x. Please install the correct version.')
+    #if torch.__version__.startswith('1.13.'):
+        #return
+    #raise RuntimeError('This script requires PyTorch 1.13.x. Please install the correct version.')
 
 
 def find_exp(exp):
