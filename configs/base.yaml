@@ -60,12 +60,12 @@ max_batch_frames: 50000
 max_batch_size: 100000
 max_val_batch_frames: 60000
 max_val_batch_size: 1
-pe: parselmouth
+pe: rmvpe
 pe_ckpt: 'checkpoints/rmvpe/model.pt'
 hnsep: vr
 hnsep_ckpt: 'checkpoints/vr/model.pt'
 f0_min: 65
-f0_max: 1100
+f0_max: 1600
 num_valid_plots: 10
 
 ###########

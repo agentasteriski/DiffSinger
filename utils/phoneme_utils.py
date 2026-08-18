@@ -1,5 +1,7 @@
+#better error handling from AlexFloareaVT ft Gemini
 import json
 import pathlib
+import atexit  # <<< MODIFIED
 from typing import Dict, List, Union
 
 from utils.hparams import hparams
@@ -49,7 +51,9 @@ class PhonemeDictionary:
                             all_phonemes.add(f'{lang}/{phoneme}')
                         else:
                             all_phonemes.add(phoneme)
+
         # Step 2: Parse merged phoneme groups
+        validation_errors = []
         if merged_groups is None:
             merged_groups = []
         else:
@@ -57,27 +61,41 @@ class PhonemeDictionary:
             for group in merged_groups:
                 _group = []
                 for phoneme in group:
+                    element_is_valid = True
                     if '/' in phoneme:
                         lang, name = phoneme.split('/', maxsplit=1)
                         if lang not in dictionaries:
-                            raise ValueError(
+                            validation_errors.append(
                                 f"Invalid phoneme tag '{phoneme}' in merged group: "
                                 f"unrecognized language name '{lang}'."
                             )
+                            element_is_valid = False
+
                         if self._multi_langs:
                             element = phoneme
                         else:
                             element = name
                     else:
                         element = phoneme
-                    if element not in all_phonemes:
-                        raise ValueError(
+
+                    if element_is_valid and element not in all_phonemes:
+                        validation_errors.append(
                             f"Invalid phoneme tag '{phoneme}' in merged group: "
                             f"not found in phoneme set."
                         )
-                    _group.append(element)
+                        element_is_valid = False
+
+                    if element_is_valid:
+                        _group.append(element)
+
                 _merged_groups.append(_group)
             merged_groups = [set(phones) for phones in _merged_groups if len(phones) > 1]
+
+        if validation_errors:
+            unique_errors = sorted(list(set(validation_errors)))
+            error_message = "Found missing or invalid phonemes in 'merged_groups':\n* " + "\n* ".join(unique_errors)
+            raise ValueError(error_message)
+
         # Step 3: Build phoneme index
         merged_phonemes_inverted_index = {}
         for idx, group in enumerate(merged_groups):
@@ -120,6 +138,8 @@ class PhonemeDictionary:
         self._phone_to_id: Dict[str, int] = phone_to_id
         self._id_to_phone: List[Union[str, tuple]] = id_to_phone
         self._cross_lingual_phonemes = frozenset(cross_lingual_phonemes)
+        
+        self._missing_phonemes = set()  # <<< MODIFIED: Add set to track missing phonemes
 
     @property
     def vocab_size(self):
@@ -135,14 +155,30 @@ class PhonemeDictionary:
     def is_cross_lingual(self, phone):
         return phone in self._cross_lingual_phonemes
 
+    # <<< MODIFIED: Add property to get missing phonemes
+    @property
+    def missing_phonemes(self):
+        return sorted(list(self._missing_phonemes))
+
+    # <<< MODIFIED: Updated encode_one to catch KeyErrors
     def encode_one(self, phone, lang=None):
-        if '/' in phone:
-            lang, phone = phone.split('/', maxsplit=1)
-        if lang is None or not self._multi_langs or phone in self._phone_to_id:
-            return self._phone_to_id[phone]
-        if '/' not in phone:
-            phone = f'{lang}/{phone}'
-        return self._phone_to_id[phone]
+        key = phone
+        try:
+            if '/' in phone:
+                lang, phone = phone.split('/', maxsplit=1)
+            
+            if lang is None or not self._multi_langs or phone in self._phone_to_id:
+                key = phone
+                return self._phone_to_id[key]
+            
+            if '/' not in phone:
+                phone = f'{lang}/{phone}'
+            
+            key = phone
+            return self._phone_to_id[key]
+        except KeyError:
+            self._missing_phonemes.add(key)
+            return PAD_INDEX  # Return 0 to avoid crashing the binarizer
 
     def encode(self, sentence, lang=None):
         phones = sentence.strip().split() if isinstance(sentence, str) else sentence
@@ -178,8 +214,10 @@ _dictionary = None
 
 
 def load_phoneme_dictionary() -> PhonemeDictionary:
+    global _dictionary  # <<< MODIFIED: Ensure we're assigning to the global var
     if _dictionary is not None:
         return _dictionary
+    
     config_dicts = hparams.get('dictionaries')
     if config_dicts is not None:
         dicts = {}
@@ -203,8 +241,24 @@ def load_phoneme_dictionary() -> PhonemeDictionary:
         dicts = {
             'default': dict_path
         }
-    return PhonemeDictionary(
+    
+    # <<< MODIFIED: Assign to global _dictionary so the exit handler can find it
+    _dictionary = PhonemeDictionary(
         dictionaries=dicts,
         extra_phonemes=hparams.get('extra_phonemes'),
         merged_groups=hparams.get('merged_phoneme_groups')
     )
+
+    # <<< MODIFIED: Add an exit handler to report all missing phonemes at the end
+    def _report_missing_phonemes():
+        if _dictionary is not None:
+            missing = _dictionary.missing_phonemes
+            if missing:
+                print("---")
+                print("ERROR: Phonemes found in data missing from dictionary:")
+                for ph in missing:
+                    print(f"* {ph}")
+
+    atexit.register(_report_missing_phonemes)
+    
+    return _dictionary

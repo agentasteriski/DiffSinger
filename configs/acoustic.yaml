@@ -24,15 +24,15 @@ binarization_args:
 augmentation_args:
   random_pitch_shifting:
     enabled: false
-    range: [-5., 5.]
-    scale: 0.75
+    range: [-3., 3.]
+    scale: 0.25
   fixed_pitch_shifting:
     enabled: false
     targets: [-5., 5.]
     scale: 0.5
   random_time_stretching:
     enabled: false
-    range: [0.5, 2.]
+    range: [0.8, 2.]
     scale: 0.75
 
 binary_data_dir: 'data/opencpop/binary'
