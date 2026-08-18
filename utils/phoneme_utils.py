@@ -24,12 +24,12 @@ class PhonemeDictionary:
                     lang, name = ph.split('/', maxsplit=1)
                     if lang not in dictionaries:
                         raise ValueError(
-                            f"Invalid phoneme tag '{ph}' in extra phonemes: "
+                            f"Invalid phoneme '{ph}' in extra phonemes: "
                             f"unrecognized language name '{lang}'."
                         )
                     if name in all_phonemes:
                         raise ValueError(
-                            f"Invalid phoneme tag '{ph}' in extra phonemes: "
+                            f"Invalid phoneme '{ph}' in extra phonemes: "
                             f"short name conflicts with existing tag."
                         )
                 all_phonemes.add(ph)
@@ -42,7 +42,7 @@ class PhonemeDictionary:
                     for phoneme in phonemes:
                         if '/' in phoneme:
                             raise ValueError(
-                                f"Invalid phoneme tag '{phoneme}' in dictionary '{dict_path}': "
+                                f"Invalid phoneme '{phoneme}' in dictionary '{dict_path}': "
                                 f"should not contain the reserved character '/'."
                             )
                         if phoneme in all_phonemes:
@@ -66,7 +66,7 @@ class PhonemeDictionary:
                         lang, name = phoneme.split('/', maxsplit=1)
                         if lang not in dictionaries:
                             validation_errors.append(
-                                f"Invalid phoneme tag '{phoneme}' in merged group: "
+                                f"Invalid phoneme '{phoneme}' in merged group: "
                                 f"unrecognized language name '{lang}'."
                             )
                             element_is_valid = False
@@ -80,7 +80,7 @@ class PhonemeDictionary:
 
                     if element_is_valid and element not in all_phonemes:
                         validation_errors.append(
-                            f"Invalid phoneme tag '{phoneme}' in merged group: "
+                            f"Invalid phoneme '{phoneme}' in merged group: "
                             f"not found in phoneme set."
                         )
                         element_is_valid = False
