@@ -224,6 +224,7 @@ class PhonemeDictionary:
         with open(filename, 'w', encoding='utf8') as fp:
             json.dump(self._phone_to_id, fp, ensure_ascii=False, indent=2)
 
+_dictionary = None
 
 def load_phoneme_dictionary() -> PhonemeDictionary:
     global _dictionary  # <<< MODIFIED: Ensure we're assigning to the global var
