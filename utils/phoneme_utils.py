@@ -97,19 +97,34 @@ class PhonemeDictionary:
             raise ValueError(error_message)
 
         # Step 3: Build phoneme index
-        merged_phonemes_inverted_index = {}
-        for idx, group in enumerate(merged_groups):
-            other_idx = None
+        # Union-find over phonemes: groups must merge transitively.
+        _uf_parent = {}
+
+        def _uf_find(p):
+            _uf_parent.setdefault(p, p)
+            while _uf_parent[p] != p:
+                _uf_parent[p] = _uf_parent[_uf_parent[p]]
+                p = _uf_parent[p]
+            return p
+
+        for group in merged_groups:
+            anchor = next(iter(group))
             for phoneme in group:
-                if phoneme in merged_phonemes_inverted_index:
-                    other_idx = merged_phonemes_inverted_index[phoneme]
-                    break
-            target_idx = idx if other_idx is None else other_idx
+                _uf_parent[_uf_find(phoneme)] = _uf_find(anchor)
+
+        _uf_classes = {}
+        for group in merged_groups:
             for phoneme in group:
-                merged_phonemes_inverted_index[phoneme] = target_idx
-            if other_idx is not None:
-                merged_groups[other_idx] |= group
-                group.clear()
+                root = _uf_find(phoneme)
+                if root not in _uf_classes:
+                    _uf_classes[root] = set()
+                _uf_classes[root].add(phoneme)
+        merged_groups = list(_uf_classes.values())
+        merged_phonemes_inverted_index = {
+            phoneme: group_idx
+            for group_idx, group in enumerate(merged_groups)
+            for phoneme in group
+        }
         phone_to_id = {}
         id_to_phone = []
         cross_lingual_phonemes = set()
@@ -208,9 +223,6 @@ class PhonemeDictionary:
     def dump(self, filename):
         with open(filename, 'w', encoding='utf8') as fp:
             json.dump(self._phone_to_id, fp, ensure_ascii=False, indent=2)
-
-
-_dictionary = None
 
 
 def load_phoneme_dictionary() -> PhonemeDictionary:
