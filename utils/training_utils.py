@@ -1,6 +1,9 @@
+import csv
 import math
 import re
+import time
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 from typing import Dict
 
@@ -8,7 +11,7 @@ import lightning.pytorch as pl
 import numpy as np
 import torch
 from lightning.fabric.loggers.tensorboard import _TENSORBOARD_AVAILABLE
-from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint, TQDMProgressBar
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from torch.optim.lr_scheduler import LambdaLR
@@ -331,6 +334,89 @@ def get_latest_checkpoint_path(work_dir):
                 last_ckpt_name = str(ckpt)
 
     return last_ckpt_name if last_ckpt_name is not None else None
+
+
+class BenchmarkCallback(Callback):
+    """Records time between checkpoints and throughput (it/s) to a CSV report file.
+
+    One row is written per checkpoint interval, at each validation end.
+    Columns:
+        step                 - global step at this checkpoint
+        timestamp            - time of this checkpoint (ISO format)
+        interval_seconds     - seconds elapsed since the previous checkpoint
+        steps_in_interval    - number of training steps completed in this interval
+        it_per_s             - iterations per second for this interval (steps / interval_seconds)
+        total_epochs         - cumulative full epochs elapsed so far (trainer.current_epoch)
+        epochs_per_interval  - full epochs completed within this interval
+        cumulative_seconds   - seconds elapsed since the start of training
+    """
+
+    def __init__(self, report_path):
+        super().__init__()
+        self.report_path = Path(report_path)
+        self._file = None
+        self._writer = None
+        self._start_time = None
+        self._last_time = None
+        self._last_step = 0
+        self._last_epoch = 0
+
+    def on_train_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        if not trainer.is_global_zero:
+            return
+        self.report_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = open(self.report_path, 'w', newline='', encoding='utf-8')
+        self._writer = csv.writer(self._file)
+        self._writer.writerow([
+            'step', 'timestamp', 'interval_seconds', 'steps_in_interval',
+            'it_per_s', 'total_epochs', 'epochs_per_interval', 'cumulative_seconds'
+        ])
+        now = time.time()
+        self._start_time = now
+        self._last_time = now
+        self._last_step = 0
+        self._last_epoch = trainer.current_epoch
+
+    def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        if not trainer.is_global_zero or self._writer is None:
+            return
+        now = time.time()
+        interval_seconds = now - self._last_time
+        steps_in_interval = trainer.global_step - self._last_step
+        it_per_s = (steps_in_interval / interval_seconds) if interval_seconds > 0 else float('nan')
+        total_epochs = trainer.current_epoch
+        epochs_per_interval = total_epochs - self._last_epoch
+        cumulative_seconds = now - self._start_time
+        timestamp = datetime.now().isoformat(timespec='seconds')
+        self._writer.writerow([
+            trainer.global_step,
+            timestamp,
+            round(interval_seconds, 3),
+            steps_in_interval,
+            round(it_per_s, 4),
+            total_epochs,
+            epochs_per_interval,
+            round(cumulative_seconds, 3),
+        ])
+        self._file.flush()
+        self._last_time = now
+        self._last_step = trainer.global_step
+        self._last_epoch = total_epochs
+
+    def on_train_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        self._close_report()
+
+    def on_exception(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", exception) -> None:
+        self._close_report()
+
+    def _close_report(self):
+        if self._file is not None:
+            try:
+                self._file.flush()
+                self._file.close()
+            finally:
+                self._file = None
+                self._writer = None
 
 
 class DsTQDMProgressBar(TQDMProgressBar):

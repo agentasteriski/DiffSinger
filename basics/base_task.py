@@ -19,7 +19,7 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_debug, rank_zero_inf
 from basics.base_module import CategorizedModule
 from utils.hparams import hparams
 from utils.training_utils import (
-    DsModelCheckpoint, DsTQDMProgressBar,
+    BenchmarkCallback, DsModelCheckpoint, DsTQDMProgressBar,
     DsBatchSampler, DsTensorBoardLogger,
     get_latest_checkpoint_path, get_strategy
 )
@@ -396,6 +396,25 @@ class BaseTask(pl.LightningModule):
         #     print("load success-------------------------------------------------------------------")
 
         work_dir = pathlib.Path(hparams['work_dir'])
+        callbacks = [
+            DsModelCheckpoint(
+                dirpath=work_dir,
+                filename='model_ckpt_steps_{step}',
+                auto_insert_metric_name=False,
+                monitor='step',
+                mode='max',
+                save_last=False,
+                # every_n_train_steps=hparams['val_check_interval'],
+                save_top_k=hparams['num_ckpt_keep'],
+                permanent_ckpt_start=hparams['permanent_ckpt_start'],
+                permanent_ckpt_interval=hparams['permanent_ckpt_interval'],
+                verbose=True
+            ),
+        ]
+        if hparams.get('benchmark_enabled', True):
+            callbacks.append(BenchmarkCallback(report_path=work_dir / hparams.get('benchmark_report_name', 'benchmark_report.csv')))
+        # LearningRateMonitor(logging_interval='step'),
+        callbacks.append(DsTQDMProgressBar())
         trainer = pl.Trainer(
             accelerator=hparams['pl_trainer_accelerator'],
             devices=hparams['pl_trainer_devices'],
@@ -408,23 +427,7 @@ class BaseTask(pl.LightningModule):
                 hparams['pl_trainer_precision'],
             ),
             precision=hparams['pl_trainer_precision'],
-            callbacks=[
-                DsModelCheckpoint(
-                    dirpath=work_dir,
-                    filename='model_ckpt_steps_{step}',
-                    auto_insert_metric_name=False,
-                    monitor='step',
-                    mode='max',
-                    save_last=False,
-                    # every_n_train_steps=hparams['val_check_interval'],
-                    save_top_k=hparams['num_ckpt_keep'],
-                    permanent_ckpt_start=hparams['permanent_ckpt_start'],
-                    permanent_ckpt_interval=hparams['permanent_ckpt_interval'],
-                    verbose=True
-                ),
-                # LearningRateMonitor(logging_interval='step'),
-                DsTQDMProgressBar(),
-            ],
+            callbacks=callbacks,
             logger=DsTensorBoardLogger(
                 save_dir=str(work_dir),
                 name='lightning_logs',
