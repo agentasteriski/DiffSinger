@@ -360,22 +360,40 @@ class BenchmarkCallback(Callback):
         self._last_time = None
         self._last_step = 0
         self._last_epoch = 0
+        self._cumulative_offset = 0.0
 
     def on_train_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         if not trainer.is_global_zero:
             return
         self.report_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(self.report_path, 'w', newline='', encoding='utf-8')
+        existing_rows = []
+        if self.report_path.exists() and self.report_path.stat().st_size > 0:
+            with open(self.report_path, 'r', newline='', encoding='utf-8') as f:
+                existing_rows = [row for row in csv.reader(f) if row]
+
+        has_header = bool(existing_rows) and existing_rows[0][0] == 'step'
+        data_rows = existing_rows[1:] if has_header else []
+
+        self._file = open(self.report_path, 'a', newline='', encoding='utf-8')
         self._writer = csv.writer(self._file)
-        self._writer.writerow([
-            'step', 'timestamp', 'interval_seconds', 'steps_in_interval',
-            'it_per_s', 'total_epochs', 'epochs_per_interval', 'cumulative_seconds'
-        ])
+        if not has_header:
+            self._writer.writerow([
+                'step', 'timestamp', 'interval_seconds', 'steps_in_interval',
+                'it_per_s', 'total_epochs', 'epochs_per_interval', 'cumulative_seconds'
+            ])
+
         now = time.time()
         self._start_time = now
         self._last_time = now
-        self._last_step = 0
+        self._last_step = trainer.global_step
         self._last_epoch = trainer.current_epoch
+        if data_rows:
+            try:
+                self._cumulative_offset = float(data_rows[-1][7])
+            except (ValueError, IndexError):
+                self._cumulative_offset = 0.0
+        else:
+            self._cumulative_offset = 0.0
 
     def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         if not trainer.is_global_zero or self._writer is None:
@@ -386,7 +404,7 @@ class BenchmarkCallback(Callback):
         it_per_s = (steps_in_interval / interval_seconds) if interval_seconds > 0 else float('nan')
         total_epochs = trainer.current_epoch
         epochs_per_interval = total_epochs - self._last_epoch
-        cumulative_seconds = now - self._start_time
+        cumulative_seconds = self._cumulative_offset + (now - self._start_time)
         timestamp = datetime.now().isoformat(timespec='seconds')
         self._writer.writerow([
             trainer.global_step,
